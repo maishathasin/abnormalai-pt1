@@ -162,6 +162,71 @@ def _sanitize_generated_draft(text: str, update_type: str) -> str:
     return cleaned
 
 
+def _extract_text_blocks(response: Any) -> str:
+    return "".join(
+        block.text for block in response.content if getattr(block, "type", None) == "text"
+    ).strip()
+
+
+def _fallback_incident_overview(packet: IncidentPacket) -> dict[str, str]:
+    overview = {
+        "narrative": (
+            f"Status-scoped incident packet for `{packet.update_type}` built from raw incident sources. "
+            f"The model should infer customer impact from logs, metrics, PagerDuty, deployments, and incident notes."
+        ),
+        "public_utc_window": packet.normalized_time["window_utc"],
+        "public_pt_window": packet.normalized_time["window_pt"],
+        "severity": packet.severity,
+        "impact_start": packet.normalized_time["started_at_utc"],
+        "impact_end": packet.normalized_time["resolved_at_utc"],
+        "impact_duration": packet.normalized_time["impact_duration_human"],
+    }
+    if (
+        packet.source_snapshot.get("final_resolution_pt")
+        and packet.source_snapshot["final_resolution_pt"] != packet.normalized_time["resolved_at_pt"]
+    ):
+        overview["final_resolution"] = packet.source_snapshot["final_resolution_pt"]
+        overview["full_duration"] = packet.source_snapshot.get("final_duration_human", "Unknown")
+    else:
+        overview["final_resolution"] = ""
+        overview["full_duration"] = ""
+    return overview
+
+
+def _strip_code_fences(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _parse_overview_response(text: str, packet: IncidentPacket) -> dict[str, str]:
+    fallback = _fallback_incident_overview(packet)
+    cleaned = _strip_code_fences(text)
+    payload_text = cleaned
+    if "{" in cleaned and "}" in cleaned:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+        payload_text = cleaned[start:end]
+    try:
+        parsed = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return fallback
+
+    if not isinstance(parsed, dict):
+        return fallback
+
+    merged: dict[str, str] = {}
+    for key, default_value in fallback.items():
+        value = parsed.get(key, default_value)
+        if isinstance(value, str) and value.strip():
+            merged[key] = value.strip()
+        else:
+            merged[key] = default_value
+    return merged
+
+
 def ensure_structured_output(packet: IncidentPacket, draft: str, update_type: str) -> str:
     cleaned = draft.strip()
     if not re.search(r"(?im)^title:\s*", cleaned):
@@ -330,6 +395,99 @@ Return only the final message text.
 """.strip()
 
 
+def _build_overview_prompt(packet: IncidentPacket, policies: dict[str, str]) -> str:
+    payload = packet_for_generation(packet)
+    return f"""
+You are preparing a concise operator-facing incident overview for a Streamlit UI.
+
+Use these policy documents exactly:
+
+<system_prompt>
+{policies["system_prompt"]}
+</system_prompt>
+
+<security>
+{policies["security"]}
+</security>
+
+<dataprocessing>
+{policies["dataprocessing"]}
+</dataprocessing>
+
+Requirements:
+- Return valid JSON only. Do not wrap it in markdown.
+- Keep every field concise and grounded in the evidence packet.
+- Use `normalized_time` as the authoritative source for timestamps and durations.
+- Keep the narrative to 2 short sentences.
+- Do not mention internal hostnames, PR numbers, database names, or engineering-only details.
+- Preserve these exact JSON keys: narrative, public_utc_window, public_pt_window, final_resolution, full_duration, severity, impact_start, impact_end, impact_duration
+- If there is no separate final resolution after monitoring, return empty strings for `final_resolution` and `full_duration`.
+- `severity` should be a short display label.
+- `impact_start`, `impact_end`, and `impact_duration` should be short strings suitable for metric cards.
+
+Evidence packet:
+{json.dumps(payload, indent=2)}
+""".strip()
+
+
+def generate_incident_overview(
+    packet: IncidentPacket,
+    base_path: str | Path,
+) -> dict[str, Any]:
+    policies = _read_policy_docs(base_path)
+    prompt = _build_overview_prompt(packet, policies)
+    started = time.perf_counter()
+    fallback = _fallback_incident_overview(packet)
+    api_key = os.getenv("ANTHROPIC_API_KEY") or _read_local_secret(base_path, "ANTHROPIC_API_KEY")
+
+    if not api_key:
+        return {
+            "overview": fallback,
+            "provider": "fallback-template",
+            "latency_seconds": round(time.perf_counter() - started, 2),
+            "prompt": prompt,
+            "error": None,
+            "error_code": None,
+            "error_message": None,
+            "model": None,
+        }
+
+    client = Anthropic(api_key=api_key)
+    try:
+        model_used = _resolve_model(base_path)
+        response = client.messages.create(
+            model=model_used,
+            max_tokens=350,
+            temperature=0.1,
+            system=policies["system_prompt"],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        overview = _parse_overview_response(_extract_text_blocks(response), packet)
+    except Exception as exc:
+        error_code, error_message = _classify_generation_error(exc)
+        return {
+            "overview": fallback,
+            "provider": "fallback-template",
+            "latency_seconds": round(time.perf_counter() - started, 2),
+            "prompt": prompt,
+            "error": f"{type(exc).__name__}: {exc}",
+            "error_code": error_code,
+            "error_message": error_message,
+            "model": None,
+        }
+
+    return {
+        "overview": overview,
+        "provider": "anthropic",
+        "latency_seconds": round(time.perf_counter() - started, 2),
+        "prompt": prompt,
+        "error": None,
+        "error_code": None,
+        "error_message": None,
+        "model": model_used,
+    }
+
+
 def generate_draft(
     packet: IncidentPacket,
     update_type: str,
@@ -365,9 +523,7 @@ def generate_draft(
             system=policies["system_prompt"],
             messages=[{"role": "user", "content": prompt}],
         )
-        draft = "".join(
-            block.text for block in response.content if getattr(block, "type", None) == "text"
-        ).strip()
+        draft = _extract_text_blocks(response)
         draft = _sanitize_generated_draft(draft, update_type)
         draft = ensure_structured_output(packet, draft, update_type)
     except Exception as exc:
