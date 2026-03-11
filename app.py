@@ -12,7 +12,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from incident_comms.generator import generate_draft, parse_generated_update  # noqa: E402
+from incident_comms.generator import generate_draft, generate_incident_overview, parse_generated_update  # noqa: E402
 from incident_comms.pipeline import (  # noqa: E402
     build_incident_packet,
     check_draft,
@@ -50,6 +50,7 @@ def get_packet(cache_version: str, update_type: str) -> dict:
 def _reset_generation_state() -> None:
     st.session_state.pop("draft_text", None)
     st.session_state.pop("draft_meta", None)
+    st.session_state.pop("overview_meta", None)
 
 
 def _ensure_packet_compatibility(packet):
@@ -63,10 +64,33 @@ def _ensure_packet_compatibility(packet):
     return packet
 
 
+def _default_overview(packet) -> dict[str, str]:
+    overview = {
+        "narrative": render_internal_narrative(packet),
+        "public_utc_window": packet.normalized_time["window_utc"],
+        "public_pt_window": packet.normalized_time["window_pt"],
+        "severity": packet.severity,
+        "impact_start": packet.normalized_time["started_at_utc"],
+        "impact_end": packet.normalized_time["resolved_at_utc"],
+        "impact_duration": packet.normalized_time["impact_duration_human"],
+        "final_resolution": "",
+        "full_duration": "",
+    }
+    if (
+        packet.source_snapshot.get("final_resolution_pt")
+        and packet.source_snapshot["final_resolution_pt"] != packet.normalized_time["resolved_at_pt"]
+    ):
+        overview["final_resolution"] = packet.source_snapshot["final_resolution_pt"]
+        overview["full_duration"] = packet.source_snapshot.get("final_duration_human", "Unknown")
+    return overview
+
+
 if "draft_text" not in st.session_state:
     st.session_state["draft_text"] = ""
 if "draft_meta" not in st.session_state:
     st.session_state["draft_meta"] = {}
+if "overview_meta" not in st.session_state:
+    st.session_state["overview_meta"] = {}
 
 
 st.title("AI-Native Incident Communications MVP")
@@ -99,6 +123,10 @@ if generate_clicked or regenerate_clicked:
             for check in check_draft(packet, previous_draft, update_type)
             if not check.passed
         ]
+    st.session_state["overview_meta"] = generate_incident_overview(
+        packet=packet,
+        base_path=ROOT,
+    )
     result = generate_draft(
         packet=packet,
         update_type=update_type,
@@ -111,20 +139,26 @@ if generate_clicked or regenerate_clicked:
     st.session_state["draft_meta"] = result
 
 
+overview_meta = st.session_state["overview_meta"]
+overview = overview_meta.get("overview", _default_overview(packet))
+
 overview_col, metrics_col = st.columns([2, 1])
 with overview_col:
     st.subheader("Incident overview")
-    st.write(render_internal_narrative(packet))
-    st.markdown(f"**Public UTC window:** {packet.normalized_time['window_utc']}")
-    st.markdown(f"**Public PT window:** {packet.normalized_time['window_pt']}")
-    if packet.source_snapshot.get("final_resolution_pt") and packet.source_snapshot["final_resolution_pt"] != packet.normalized_time["resolved_at_pt"]:
-        st.markdown(f"**Final resolution after monitoring:** {packet.source_snapshot['final_resolution_pt']}")
-        st.markdown(f"**Full incident duration:** {packet.source_snapshot.get('final_duration_human')}")
+    st.write(overview["narrative"])
+    st.markdown(f"**Public UTC window:** {overview['public_utc_window']}")
+    st.markdown(f"**Public PT window:** {overview['public_pt_window']}")
+    if overview["final_resolution"]:
+        st.markdown(f"**Final resolution after monitoring:** {overview['final_resolution']}")
+    if overview["full_duration"]:
+        st.markdown(f"**Full incident duration:** {overview['full_duration']}")
+    if overview_meta.get("error"):
+        st.caption("Overview generation fell back to packet-derived values.")
 with metrics_col:
-    st.metric("Severity", packet.severity)
-    st.metric("Impact start", packet.normalized_time["started_at_utc"])
-    st.metric("Impact end", packet.normalized_time["resolved_at_utc"])
-    st.metric("Impact duration", packet.normalized_time["impact_duration_human"])
+    st.metric("Severity", overview["severity"])
+    st.metric("Impact start", overview["impact_start"])
+    st.metric("Impact end", overview["impact_end"])
+    st.metric("Impact duration", overview["impact_duration"])
 
 
 review_tab, evidence_tab, raw_tab = st.tabs(["Review console", "Evidence and citations", "Raw sources"])
@@ -195,10 +229,6 @@ with review_tab:
                     "raw_error": meta.get("error"),
                 }
             )
-            with st.expander("System prompt", expanded=False):
-                st.code((ROOT / "docs" / "system_prompt.md").read_text(), language="markdown")
-            with st.expander("Rendered user prompt", expanded=False):
-                st.code(meta.get("prompt", ""), language="markdown")
         else:
             st.info("No draft generated yet.")
 

@@ -11,7 +11,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from incident_comms.pipeline import build_incident_packet, check_draft, load_demo_dataset
-from incident_comms.generator import _classify_generation_error
+from incident_comms.generator import _classify_generation_error, _parse_overview_response
 
 
 class PipelineTests(unittest.TestCase):
@@ -65,6 +65,31 @@ class PipelineTests(unittest.TestCase):
         code, message = _classify_generation_error(Exception("Connection error."))
         self.assertEqual(code, "connection_error")
         self.assertIn("could not reach Anthropic", message)
+
+    def test_overview_parser_accepts_json_in_code_fence(self) -> None:
+        parsed = _parse_overview_response(
+            """```json
+            {
+              "narrative": "Customers experienced degraded API performance while mitigation was in progress.",
+              "public_utc_window": "Between January 15, 2025 at 14:23 UTC and January 15, 2025 at 14:45 UTC",
+              "public_pt_window": "Jan 15, 06:23 - 06:45 PST",
+              "final_resolution": "",
+              "full_duration": "",
+              "severity": "SEV-2",
+              "impact_start": "January 15, 2025 at 14:23 UTC",
+              "impact_end": "January 15, 2025 at 14:45 UTC",
+              "impact_duration": "22 mins"
+            }
+            ```""",
+            self.packet,
+        )
+        self.assertEqual(parsed["severity"], "SEV-2")
+        self.assertEqual(parsed["impact_duration"], "22 mins")
+
+    def test_overview_parser_falls_back_for_invalid_json(self) -> None:
+        parsed = _parse_overview_response("not json", self.packet)
+        self.assertEqual(parsed["severity"], self.packet.severity)
+        self.assertEqual(parsed["impact_start"], self.packet.normalized_time["started_at_utc"])
 
 
 if __name__ == "__main__":
